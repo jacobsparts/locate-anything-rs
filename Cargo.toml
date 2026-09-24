@@ -1,0 +1,34 @@
+[package]
+name = "locate-anything-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone LocateAnything-3B (MoonViT + Qwen2) inference engine"
+license = "MIT"
+repository = "https://github.com/jacobsparts/locate-anything-rs"
+readme = "README.md"
+
+[[bin]]
+name = "locate-anything"
+path = "src/main.rs"
+
+[features]
+default = ["cuda"]
+cuda = []
+
+[dependencies]
+libc = "0.2"
+png = "0.17"
+rayon = "1"
+# Shared driver layer + kernel set (driver bindings, module/launch/buffer,
+# embedded fatbin). The engine's src/cuda.rs is a thin layer over this.
+lightgpu = { git = "https://github.com/jacobsparts/lightgpu.git" }
+
+[build-dependencies]
+# Shared nvcc invocation (arch list, numeric flags) for any engine-local
+# kernel file. Unused today: the engine runs the toolkit's kernel set.
+lightgpu-build = { git = "https://github.com/jacobsparts/lightgpu.git", package = "lightgpu-build" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
