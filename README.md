@@ -2,6 +2,7 @@
 
 One of the [lightgpu inference engines](https://github.com/jacobsparts/lightgpu).
 The family also includes [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
+[nafnet-rs](https://github.com/jacobsparts/nafnet-rs),
 [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs) and
 [lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs); they share the
 [lightgpu toolkit](https://github.com/jacobsparts/lightgpu).
