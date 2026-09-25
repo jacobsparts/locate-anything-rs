@@ -259,8 +259,9 @@ Two independent backends share one graph:
   arena.
 - **CPU** (`src/cpu.rs`): the same kernels as rayon-parallel Rust over the
   native 34-byte blocks. Nothing is uploaded or repacked; the container is read
-  directly from the mmap. This backend is the semantic reference for the GPU
-  kernels.
+  directly from the mmap. It is the fallback for a machine with no GPU, not a
+  test harness: it is tuned on its own terms, and the two backends are held to
+  the tolerance published in [Verification](#verification).
 
 The engine: the image is patchified and run through the 27-layer MoonViT, a
 2-layer MLP connector projects the merged features into the language model's

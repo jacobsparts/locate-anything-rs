@@ -2,8 +2,7 @@
 //!
 //! What is *engine-specific* and lives here:
 //!   * the `CPU_MODE` switch, which makes `Buffer` a host allocation so the whole
-//!     graph can run without a GPU (and so the CPU path is the reference the GPU
-//!     path is diffed against);
+//!     graph can run without a GPU;
 //!   * `Buffer`, whose address is a `CUdeviceptr` on the GPU and a host address
 //!     on the CPU, so every caller treats addresses uniformly;
 //!
