@@ -580,11 +580,12 @@ fn cmd_gpuinfo() -> Result<(), String> {
     // load works on this driver before any kernel exists.
     #[cfg(feature = "cuda")]
     {
-        let m = lightgpu::vm::Module::load(cuda::embed_fatbin())?;
+        let m = lightgpu::vm::Module::load(cuda::embed_toolkit_fatbin())?;
         m.func("lg_noop")?;
+        m.func("lg_attn_prefill_scores")?;
         println!(
-            "fatbin    : {} bytes, loaded module, resolved lg_noop",
-            cuda::embed_fatbin().len()
+            "fatbin    : {} bytes toolkit, loaded",
+            cuda::embed_toolkit_fatbin().len()
         );
     }
     #[cfg(not(feature = "cuda"))]

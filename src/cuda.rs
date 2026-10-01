@@ -105,10 +105,11 @@ impl Buffer {
 // its own Drop (`lightgpu::vm`), so this type needs no raw driver calls at all.
 
 
-/// The kernel set's fatbin, compiled by the toolkit's build script. Absent in a
-/// build without the `cuda` feature (`cargo build --no-default-features`),
+/// The toolkit's kernel set, compiled by the toolkit's build script. Absent in
+/// a build without the `cuda` feature (`cargo build --no-default-features`),
 /// which is what a machine with no CUDA toolkit uses.
 #[cfg(feature = "cuda")]
-pub fn embed_fatbin() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/la_kernels.fatbin"))
+pub fn embed_toolkit_fatbin() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/la_toolkit.fatbin"))
 }
+

@@ -1,11 +1,19 @@
-//! The engine no longer compiles or embeds the whole toolkit kernel set: it
-//! declares the kernels it actually calls and nvcc generates code for those
-//! only (`--entries`), so nothing unused reaches the binary.
+//! Compiles the kernels this engine needs into ONE module.
+//!
+//! Every op here comes from the shared `lightgpu` toolkit, including the
+//! batched-GEMM prefill attention (`lg_attn_prefill_*`), which was written
+//! engine-local first and promoted once it measured faster - see that kernel's
+//! comment in the toolkit for the numbers and for why the obvious version of it
+//! is not the fast one.
+//!
+//! The list is checked against the toolkit's `cuda/kernels.cu` before nvcc runs,
+//! so a typo or a name the toolkit renamed away fails the build rather than the
+//! first forward pass. The other direction matters too: a kernel the toolkit
+//! gains is not compiled here unless it is listed, which is what keeps this
+//! engine's fatbin from growing on its own.
 
-/// Every kernel this engine resolves by name. Kept in one place so it can be
-/// checked against the toolkit before nvcc runs: an unknown name here would
-/// otherwise fail at module load instead of at build time.
-const KERNELS: &[&str] = &[
+/// Generic ops that live in the shared toolkit.
+const TOOLKIT_KERNELS: &[&str] = &[
     // elementwise / norm / rope
     "lg_noop",
     "lg_rms_norm",
@@ -17,9 +25,13 @@ const KERNELS: &[&str] = &[
     "lg_gelu_erf",
     "lg_add_inplace",
     "lg_row_affine",
-    // attention
+    // attention: decode (warp per query token) and the batched-GEMM prefill
+    // form (scores -> row softmax -> PV), which the ViT also uses via
+    // query tiles
     "lg_attn_gqa",
-    "lg_attn_flash",
+    "lg_attn_prefill_scores",
+    "lg_attn_prefill_softmax",
+    "lg_attn_prefill_out",
     // GEMM / quantized GEMM
     "lg_f32_gemm",
     "lg_f32_gemm_tiled",
@@ -40,14 +52,21 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     // Fail the build, not the run, on a kernel name the toolkit does not define.
-    for k in KERNELS {
+    for k in TOOLKIT_KERNELS {
         assert!(
             lightgpu_build::known_kernel(k),
             "unknown kernel `{k}`: not defined by the toolkit"
         );
     }
 
-    let src = lightgpu_build::toolkit_kernels_cu()
+    let toolkit = lightgpu_build::toolkit_kernels_cu()
         .expect("locate the toolkit's cuda/kernels.cu (set LA_GPU_DIR to override)");
-    lightgpu_build::fatbin_entries(&src.to_string_lossy(), "la_kernels.fatbin", KERNELS);
+
+    lightgpu_build::fatbin_modules(&[
+        lightgpu_build::Source {
+            path: &toolkit.to_string_lossy(),
+            out_name: "la_toolkit.fatbin",
+            entries: Some(TOOLKIT_KERNELS),
+        },
+    ]);
 }

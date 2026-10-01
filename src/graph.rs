@@ -52,6 +52,10 @@ impl DecodeCtx {
 
 pub struct Scratch {
     pub x: Buffer,  // [hidden, seq]
+    /// [n_heads, seq, seq] score matrix for batched-GEMM prefill attention.
+    /// Only allocated for the prefill scratch; a decode scratch leaves it
+    /// zero-sized, since decode keeps the warp-per-token `lg_attn_gqa`.
+    pub sc_pre: Buffer,
     pub xn: Buffer, // [hidden, seq]
     pub q: Buffer,  // [hd, n_heads, seq]
     pub k: Buffer,
@@ -67,8 +71,24 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(lm: &Lm, seq: usize) -> Result<Scratch, String> {
+        Scratch::with_attn_scratch(lm, seq, false)
+    }
+
+    /// `batched_attn` additionally reserves the [n_heads, seq, seq] score matrix
+    /// that the three-stage prefill attention sweeps. Decode does not use it, so
+    /// the default leaves it empty rather than spending 124 MB on a token step.
+    pub fn with_attn_scratch(
+        lm: &Lm,
+        seq: usize,
+        batched_attn: bool,
+    ) -> Result<Scratch, String> {
         Ok(Scratch {
             x: Buffer::alloc(lm.hidden * seq * 4)?,
+            sc_pre: Buffer::alloc(if batched_attn {
+                lm.n_heads * seq * seq * 4
+            } else {
+                0
+            })?,
             xn: Buffer::alloc(lm.hidden * seq * 4)?,
             q: Buffer::alloc(lm.head_dim * lm.n_heads * seq * 4)?,
             k: Buffer::alloc(lm.head_dim * lm.n_kv_heads * seq * 4)?,
@@ -117,7 +137,7 @@ impl K {
                 eprintln!("backend   : CPU");
                 return Ok(K { module: None });
             }
-            let module = Module::load(cuda::embed_fatbin())?;
+            let module = Module::load(cuda::embed_toolkit_fatbin())?;
             eprintln!("backend   : CUDA");
             Ok(K {
                 module: Some(module),
@@ -400,6 +420,161 @@ impl K {
         aa.launch(self.module_of("lg_attn_gqa")?, "lg_attn_gqa", Launch::new((((jobs) + warps - 1) / warps, 1, 1), (warps * 32, 1, 1)).shared(0))
     }
 
+    /// Batched-GEMM prefill attention: scores -> row softmax -> PV, over the
+    /// whole prompt at once. The CPU backend keeps `lg_attn_gqa`'s twin, so the
+    /// two paths stay comparable.
+    pub fn attn_prefill(
+        &self,
+        q: CUdeviceptr,
+        kk: CUdeviceptr,
+        vv: CUdeviceptr,
+        mask: CUdeviceptr,
+        s: CUdeviceptr,
+        out: CUdeviceptr,
+        hd: usize,
+        n_qh: usize,
+        n_kvh: usize,
+        ntq: usize,
+        ntk: usize,
+    ) -> Result<(), String> {
+        if cuda::cpu_mode() {
+            return cpu::attn(q, kk, vv, mask, out, hd, n_qh, n_kvh, ntq, ntk);
+        }
+        self.attn_prefill_scores(q, kk, mask, s, hd, n_qh, n_kvh, ntq, ntk)?;
+        self.attn_prefill_softmax(s, ntq, ntk, n_qh)?;
+        self.attn_prefill_out(s, vv, out, hd, n_qh, n_kvh, ntq, ntk)
+    }
+
+    /// Batched-GEMM prefill attention, stage 1: s[h,i,j] = scale * q_i . k_j + mask.
+    ///
+    /// The whole query block is known at once during prefill, so the key walk
+    /// moves out of the inner loop: one block per (query tile, head) sweeps its
+    /// keys with the head dimension contiguous, against 1391 serial key steps
+    /// per warp in `lg_attn_gqa`.
+    pub fn attn_prefill_scores(
+        &self,
+        q: CUdeviceptr,
+        kk: CUdeviceptr,
+        mask: CUdeviceptr,
+        s: CUdeviceptr,
+        hd: usize,
+        n_qh: usize,
+        n_kvh: usize,
+        ntq: usize,
+        ntk: usize,
+    ) -> Result<(), String> {
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        // Must match LA_PF_QT/LA_PF_KT in the kernel: the launch shape and the
+        // tile shape are two halves of one contract, and a mismatch computes the
+        // wrong scores rather than failing loudly.
+        let qt = 32usize;
+        let mut aa = Args::new();
+        aa.ptr(q).ptr(kk).ptr(mask).ptr(s)
+            .i32(hd as i32).i32(n_qh as i32).i32(n_kvh as i32)
+            .i32(ntq as i32).i32(ntk as i32).f32(scale);
+        // grid = (key tile, query tile, head): the kernel stages a 32x32 tile of
+        // Q and K in shared memory, so the head has to be a grid axis rather
+        // than a block axis.
+        aa.launch(
+            self.module_of("lg_attn_prefill_scores")?,
+            "lg_attn_prefill_scores",
+            Launch::new(
+                (((ntk + qt - 1) / qt) as u32, ((ntq + qt - 1) / qt) as u32, n_qh as u32),
+                (256, 1, 1),
+            )
+            .shared(0),
+        )
+    }
+
+    /// Stage 2: in-place row softmax over the key axis of s[n_qh, ntq, ntk].
+    pub fn attn_prefill_softmax(
+        &self,
+        s: CUdeviceptr,
+        ntq: usize,
+        ntk: usize,
+        n_qh: usize,
+    ) -> Result<(), String> {
+        let mut aa = Args::new();
+        aa.ptr(s).i32(ntq as i32).i32(ntk as i32);
+        aa.launch(
+            self.module_of("lg_attn_prefill_softmax")?,
+            "lg_attn_prefill_softmax",
+            Launch::new((1, ntq as u32, n_qh as u32), (256, 1, 1)).shared(0),
+        )
+    }
+
+    /// Stage 3: out[h,i,:] = sum_j p[h,i,j] * v[j, gq, :].
+    pub fn attn_prefill_out(
+        &self,
+        p: CUdeviceptr,
+        v: CUdeviceptr,
+        out: CUdeviceptr,
+        hd: usize,
+        n_qh: usize,
+        n_kvh: usize,
+        ntq: usize,
+        ntk: usize,
+    ) -> Result<(), String> {
+        let qt = 16usize;
+        let mut aa = Args::new();
+        aa.ptr(p).ptr(v).ptr(out)
+            .i32(hd as i32).i32(n_qh as i32).i32(n_kvh as i32)
+            .i32(ntq as i32).i32(ntk as i32);
+        // One block per (query tile, head); the 128 threads are the head
+        // dimension, so hd must not exceed the block. Both of this engine's
+        // head sizes are within it: 128 (LM) and 72 (ViT, via the query-tiled
+        // path). A larger head would silently drop threads past 128.
+        assert!(hd <= 128, "lg_attn_prefill_out requires hd <= 128 (got {hd})");
+        aa.launch(
+            self.module_of("lg_attn_prefill_out")?,
+            "lg_attn_prefill_out",
+            Launch::new((1, ((ntq + qt - 1) / qt) as u32, n_qh as u32), (128, 1, 1)).shared(0),
+        )
+    }
+
+    /// Query-tiled batched attention: the three prefill stages run once per
+    /// query tile, so the score matrix is `n_qh * qt * ntk` instead of
+    /// `n_qh * ntq * ntk`.
+    ///
+    /// Tiling bounds the score matrix at `n_qh * qt * ntk` floats instead of
+    /// `n_qh * ntq * ntk` (44 MB at qt=128 rather than 1.87 GB at qt=5408).
+    /// Memory is not actually the binding constraint - the full matrix does fit
+    /// in 7.82 GiB alongside the weights, and it measured 331.9 ms/layer against
+    /// 345 ms at qt=128, so going bigger barely helps. It needs no new CUDA:
+    /// the kernels index `s[(h*ntq + i)*ntk + j]` and
+    /// `q[(q0+r)*n_qh*hd + h*hd + c]`, so passing `ntq = n` with q/out offset by
+    /// `q0 * n_qh * hd` makes a tile a complete, self-contained problem.
+    pub fn attn_prefill_tiled(
+        &self,
+        q: CUdeviceptr,
+        k: CUdeviceptr,
+        v: CUdeviceptr,
+        s: CUdeviceptr,
+        out: CUdeviceptr,
+        hd: usize,
+        n_qh: usize,
+        n_kvh: usize,
+        ntq: usize,
+        ntk: usize,
+        qt: usize,
+    ) -> Result<(), String> {
+        if cuda::cpu_mode() {
+            return cpu::attn(q, k, v, 0, out, hd, n_qh, n_kvh, ntq, ntk);
+        }
+        assert!(qt > 0, "query tile must be non-zero");
+        let row = (n_qh * hd * 4) as u64; // bytes per query token across all heads
+        let mut q0 = 0usize;
+        while q0 < ntq {
+            let n = qt.min(ntq - q0);
+            let off = q0 as u64 * row;
+            self.attn_prefill_scores(q + off, k, 0, s, hd, n_qh, n_kvh, n, ntk)?;
+            self.attn_prefill_softmax(s, n, ntk, n_qh)?;
+            self.attn_prefill_out(s, v, out + off, hd, n_qh, n_kvh, n, ntk)?;
+            q0 += n;
+        }
+        Ok(())
+    }
+
     /// gate += silu(gate) * up  (in place on gate, elementwise over n)
     pub fn silu_mul(&self, gate: CUdeviceptr, up: CUdeviceptr, n: usize) -> Result<(), String> {
         if cuda::cpu_mode() {
@@ -580,49 +755,6 @@ impl K {
         aa.launch(self.module_of("lg_layer_norm")?, "lg_layer_norm", Launch::new((nrows as u32, 1, 1), (256, 1, 1)).shared(0))
     }
 
-    /// Self-attention with K/V staged in shared memory (see lg_attn_flash).
-    /// Same arithmetic as attn_gqa; a block owns (head, W query tokens) so each
-    /// K/V element is read from DRAM once per block instead of once per query.
-    pub fn attn_flash(
-        &self,
-        q: CUdeviceptr,
-        k: CUdeviceptr,
-        v: CUdeviceptr,
-        out: CUdeviceptr,
-        hd: usize,
-        nh: usize,
-        ntok: usize,
-        mask: CUdeviceptr,
-    ) -> Result<(), String> {
-        if cuda::cpu_mode() {
-            return cpu::attn(q, k, v, mask, out, hd, nh, nh, ntok, ntok);
-        }
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        // Query tokens per block and key chunk staged in shared memory.
-        let w: usize = 16;
-        let kc: usize = 32;
-        let shared = (2 * kc * hd * 4) as u32;
-        let mut aa = Args::new();
-        aa.ptr(q).ptr(k).ptr(v).ptr(mask).ptr(out).i32(hd as i32).i32(nh as i32).i32(ntok as i32).i32(ntok as i32).f32(scale).i32(kc as i32);
-        aa.launch(self.module_of("lg_attn_flash")?, "lg_attn_flash", Launch::new((nh as u32, (((ntok + w - 1) / w).max(1)) as u32, 1), ((w * 32) as u32, 1, 1)).shared(shared))
-    }
-
-    /// Attention over ALL keys (no mask): q,k,v [hd, nh, ntok].
-    pub fn attn_full(
-        &self,
-        q: CUdeviceptr,
-        k: CUdeviceptr,
-        v: CUdeviceptr,
-        out: CUdeviceptr,
-        hd: usize,
-        nh: usize,
-        ntok: usize,
-    ) -> Result<(), String> {
-        // The naive warp-per-query kernel re-reads every K/V row for every query
-        // token (measured 41 ms/layer vs 21 ms/layer here), so the shared-memory
-        // staged kernel is the only path.
-        self.attn_flash(q, k, v, out, hd, nh, ntok, 0)
-    }
 }
 
 /// One Qwen2 decoder layer, mirroring src/qwen2.cpp of the reference engine:
@@ -930,7 +1062,7 @@ impl Lm {
         if seq > kv.max_seq {
             return Err("kv cache too small".into());
         }
-        let s = Scratch::new(self, seq)?;
+        let s = Scratch::with_attn_scratch(self, seq, !cuda::cpu_mode())?;
         s.x.upload(unsafe {
             std::slice::from_raw_parts(embeds.as_ptr() as *const u8, embeds.len() * 4)
         })?;
@@ -941,6 +1073,11 @@ impl Lm {
         s.mask.upload(unsafe {
             std::slice::from_raw_parts(mask.as_ptr() as *const u8, seq * seq * 4)
         })?;
+        // The batched path adds the mask itself, from the same host-built table
+        // in the same [ntq, ntk] layout. The CPU twin takes the same pointer, so
+        // both backends see the causal mask; passing 0 here would make prefill
+        // unmasked and the decode collapse into a repeated token.
+        let mask_b = Some(&s.mask);
         let row = self.head_dim * self.n_kv_heads * 4;
         for i in 0..self.n_layers {
             let n = lm_layer_names(i);
@@ -1004,11 +1141,16 @@ impl Lm {
             // whole-chunk copy into cache slots [0, seq)
             k.copy_bytes(kv.k[i].ptr, s.k.ptr, row * seq)?;
             k.copy_bytes(kv.v[i].ptr, s.v.ptr, row * seq)?;
-            k.attn_gqa(
+            // Batched-GEMM attention (scores -> softmax -> PV) for the whole
+            // prompt: `lg_attn_gqa` walks 1391 keys per warp with a serial
+            // online-softmax rescale, which measured at 5.5 s over the 36
+            // layers; this lifts the same arithmetic into three dense sweeps.
+            k.attn_prefill(
                 s.q.ptr,
                 kv.k[i].ptr,
                 kv.v[i].ptr,
-                s.mask.ptr,
+                mask_b.as_ref().map(|b| b.ptr).unwrap_or(0),
+                s.sc_pre.ptr,
                 s.attn_out.ptr,
                 self.head_dim,
                 self.n_heads,
@@ -1099,6 +1241,10 @@ pub struct VitScratch {
     pub k: Buffer,
     pub v: Buffer,
     pub attn: Buffer,   // [hidden, ntok]
+    /// [n_heads, qtile, ntok] score matrix for the query-tiled batched
+    /// attention. Sized by the tile, not by ntok, so the allocation stays at
+    /// tens of MB even though ntok is 5408.
+    pub sc_pre: Buffer,
     pub ff: Buffer,     // [inter, ntok]
     pub vf: Buffer,     // [hidden, ntok] post final_norm
     pub merged: Buffer, // [4*hidden, m]
@@ -1111,7 +1257,7 @@ pub struct VitScratch {
 }
 
 impl VitScratch {
-    pub fn new(v: &Vit) -> Result<VitScratch, String> {
+    pub fn new(v: &Vit, qtile: usize) -> Result<VitScratch, String> {
         let ntok = v.gh * v.gw;
         let m = (v.gh / 2) * (v.gw / 2);
         let npairs = v.head_dim / 2;
@@ -1125,6 +1271,7 @@ impl VitScratch {
             k: Buffer::alloc(v.hidden * ntok * 4)?,
             v: Buffer::alloc(v.hidden * ntok * 4)?,
             attn: Buffer::alloc(v.hidden * ntok * 4)?,
+            sc_pre: Buffer::alloc(v.n_heads * qtile.min(ntok) * ntok * 4)?,
             ff: Buffer::alloc(v.inter * ntok * 4)?,
             vf: Buffer::alloc(v.hidden * ntok * 4)?,
             merged: Buffer::alloc(4 * v.hidden * m * 4)?,
@@ -1158,7 +1305,12 @@ impl Vit {
         pixel_values: &[f32],
     ) -> Result<Vec<f32>, String> {
         let ntok = self.ntok();
-        let s = VitScratch::new(self)?;
+        // Query tile for the batched attention: the score matrix is
+        // [16, qtile, ntok] f32, so 128 -> 44 MB and a full ntok would be
+        // 1.87 GB. Measured essentially flat from 128 to 5408 (345 vs 332
+        // ms/layer), so the tile size is not worth tuning.
+        let qtile = 128usize;
+        let s = VitScratch::new(self, qtile)?;
         s.pixels.upload(f32_bytes(pixel_values))?;
 
         // ---- patch embedding: y = W[588,1152]^T x + b + pos_emb ----
@@ -1244,14 +1396,18 @@ impl Vit {
                 self.n_heads,
                 ntok,
             )?;
-            k.attn_full(
+            k.attn_prefill_tiled(
                 s.q.ptr,
                 s.k.ptr,
                 s.v.ptr,
+                s.sc_pre.ptr,
                 s.attn.ptr,
                 self.head_dim,
                 self.n_heads,
+                self.n_heads,
                 ntok,
+                ntok,
+                qtile,
             )?;
             let wo = w.get(&format!("{p}wo.weight"))?;
             let wb = w.get(&format!("{p}wo.bias"))?;
