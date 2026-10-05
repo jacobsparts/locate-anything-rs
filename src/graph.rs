@@ -26,6 +26,60 @@ pub struct Lm {
     pub rope_theta: f32,
 }
 
+
+/// Env-gated in-situ GEMM profiler (LA_PROF=1): accumulate per-shape wall time
+/// across `gemm_q8_fast` calls, then dump. Resolves the bench-vs-in-situ
+/// contradiction by measuring the real shapes the engine actually runs.
+pub struct GemmProf;
+/// (ne0, ne1, ncols, count, total_ms, label). label empty = a q8 GEMM keyed by
+/// shape; label set = a named non-GEMM op (ViT attention sub-kernels, f32 GEMM).
+static GPROF: std::sync::Mutex<Vec<(usize, usize, usize, usize, f64, String)>> =
+    std::sync::Mutex::new(Vec::new());
+impl GemmProf {
+    pub fn enabled() -> bool {
+        std::env::var("LA_PROF").map(|v| v == "1").unwrap_or(false)
+    }
+    pub fn rec(ne0: usize, ne1: usize, ncols: usize, ms: f64) {
+        let mut g = GPROF.lock().unwrap();
+        for e in g.iter_mut() {
+            if e.5.is_empty() && e.0 == ne0 && e.1 == ne1 && e.2 == ncols {
+                e.3 += 1;
+                e.4 += ms;
+                return;
+            }
+        }
+        g.push((ne0, ne1, ncols, 1, ms, String::new()));
+    }
+    pub fn rec_op(label: &str, ms: f64) {
+        let mut g = GPROF.lock().unwrap();
+        for e in g.iter_mut() {
+            if e.5 == label {
+                e.3 += 1;
+                e.4 += ms;
+                return;
+            }
+        }
+        g.push((0, 0, 0, 1, ms, label.to_string()));
+    }
+    pub fn dump(tag: &str) {
+        let g = GPROF.lock().unwrap();
+        eprintln!("--- GEMM profile [{tag}] ---");
+        let mut tot = 0.0;
+        for (ne0, ne1, ncols, n, ms, label) in g.iter() {
+            if label.is_empty() {
+                let fl = 2.0 * (*ne0 as f64) * (*ne1 as f64) * (*ncols as f64) * (*n as f64);
+                eprintln!(
+                    "  q8 {ne0:5}x{ne1:6} cols={ncols:5} x{n:3}  {ms:9.2} ms  {:7.0} GF/s",
+                    fl / (*ms) / 1e3
+                );
+            } else {
+                eprintln!("  {label:28} x{n:3}  {ms:9.2} ms");
+            }
+            tot += *ms;
+        }
+        eprintln!("  TOTAL {tot:.2} ms");
+    }
+}
 /// Reusable per-step buffers for incremental decoding, so decode_step does not
 /// re-allocate (and re-zero) a batch-sized scratch, a position buffer and a
 /// vocab-sized logits staging buffer on every token.
@@ -270,6 +324,26 @@ impl K {
         aa.launch(self.module_of("lg_q8_0_gemm_dp4a")?, "lg_q8_0_gemm_dp4a", Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 31) / 32) as u32, 1), (256, 1, 1)).shared(0))
     }
 
+
+    /// Tiled q8_0 GEMM (4x arithmetic intensity): locate-anything exclusive.
+    /// Same signature as gemm_q8_dp4a6 but grid (ceil(ne1/128), ceil(ncols/64)).
+    pub fn gemm_q8_tiled2(
+        &self,
+        w: CUdeviceptr,
+        qs: CUdeviceptr,
+        sc: CUdeviceptr,
+        y: CUdeviceptr,
+        ne0: usize,
+        ne1: usize,
+        ncols: usize,
+    ) -> Result<(), String> {
+        if cuda::cpu_mode() {
+            return cpu::q8_gemm(w, qs, sc, y, ne0, ne1, ncols, None);
+        }
+        let mut aa = Args::new();
+        aa.ptr(w).ptr(qs).ptr(sc).ptr(y).i32(ne0 as i32).i32(ne1 as i32).i32(ncols as i32);
+        aa.launch(self.module_of("lg_q8_0_gemm_tiled2")?, "lg_q8_0_gemm_tiled2", Launch::new((((ne1 + 127) / 128) as u32, ((ncols + 63) / 64) as u32, 1), (256, 1, 1)).shared(0))
+    }
     /// q8_0 GEMM with the fastest available kernel: quantize the activation into
     /// `qs`/`sc` and run the dp4a GEMM over the aligned 36-byte weight layout.
     pub fn gemm_q8_fast(
@@ -283,6 +357,18 @@ impl K {
         ne1: usize,
         ncols: usize,
     ) -> Result<(), String> {
+        if GemmProf::enabled() {
+            // Drain queued work first so this GEMM's measurement absorbs only
+            // its own kernels, not whatever non-gemm work was launched since the
+            // last timed call (ViT attention sits between wo and the next gemm).
+            self.sync()?;
+            let t = std::time::Instant::now();
+            self.quantize_q8_0(x, qs, sc, ne0, ncols)?;
+            self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols)?;
+            self.sync()?;
+            GemmProf::rec(ne0, ne1, ncols, t.elapsed().as_secs_f64() * 1e3);
+            return Ok(());
+        }
         self.quantize_q8_0(x, qs, sc, ne0, ncols)?;
         self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols)
     }
@@ -531,10 +617,10 @@ impl K {
         // Q and K in shared memory, so the head has to be a grid axis rather
         // than a block axis.
         aa.launch(
-            self.module_of("lg_attn_prefill_scores")?,
-            "lg_attn_prefill_scores",
+            self.module_of("lg_attn_prefill_scores2")?,
+            "lg_attn_prefill_scores2",
             Launch::new(
-                (((ntk + qt - 1) / qt) as u32, ((ntq + qt - 1) / qt) as u32, n_qh as u32),
+                (((ntk + 63) / 64) as u32, ((ntq + 63) / 64) as u32, n_qh as u32),
                 (256, 1, 1),
             )
             .shared(0),
@@ -580,10 +666,10 @@ impl K {
         // longer tied to the block size; both of this engine's head sizes
         // (128 LM, 72 ViT) are handled uniformly.
         aa.launch(
-            self.module_of("lg_attn_prefill_out")?,
-            "lg_attn_prefill_out",
+            self.module_of("lg_attn_prefill_out2")?,
+            "lg_attn_prefill_out2",
             Launch::new(
-                (((hd + 63) / 64) as u32, ((ntq + 31) / 32) as u32, n_qh as u32),
+                (((hd + 63) / 64) as u32, ((ntq + 63) / 64) as u32, n_qh as u32),
                 (256, 1, 1),
             )
             .shared(0),
@@ -620,14 +706,30 @@ impl K {
             return cpu::attn(q, k, v, 0, out, hd, n_qh, n_kvh, ntq, ntk);
         }
         assert!(qt > 0, "query tile must be non-zero");
+        let prof = GemmProf::enabled();
         let row = (n_qh * hd * 4) as u64; // bytes per query token across all heads
         let mut q0 = 0usize;
         while q0 < ntq {
             let n = qt.min(ntq - q0);
             let off = q0 as u64 * row;
+            let t0 = std::time::Instant::now();
             self.attn_prefill_scores(q + off, k, 0, s, hd, n_qh, n_kvh, n, ntk)?;
+            if prof {
+                self.sync()?;
+                GemmProf::rec_op("attn_scores", t0.elapsed().as_secs_f64() * 1e3);
+            }
+            let t1 = std::time::Instant::now();
             self.attn_prefill_softmax(s, n, ntk, n_qh)?;
+            if prof {
+                self.sync()?;
+                GemmProf::rec_op("attn_softmax", t1.elapsed().as_secs_f64() * 1e3);
+            }
+            let t2 = std::time::Instant::now();
             self.attn_prefill_out(s, v, out + off, hd, n_qh, n_kvh, n, ntk)?;
+            if prof {
+                self.sync()?;
+                GemmProf::rec_op("attn_out", t2.elapsed().as_secs_f64() * 1e3);
+            }
             q0 += n;
         }
         Ok(())
@@ -1285,6 +1387,9 @@ impl Lm {
         k.gemm_q8(head.addr, last, tmp.ptr, self.hidden, self.vocab, 1)?;
         k.copy_bytes(logits.ptr, tmp.ptr, self.vocab * 4)?;
         kv.len = seq;
+        if GemmProf::enabled() {
+            GemmProf::dump("prefill");
+        }
         Ok(())
     }
 }

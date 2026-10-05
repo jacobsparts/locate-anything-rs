@@ -40,6 +40,9 @@ const TOOLKIT_KERNELS: &[&str] = &[
     "lg_quantize_q8_0",
     "lg_q8_0_gemm_dp4a",
     "lg_q8_0_gemm_aligned",
+    "lg_q8_0_gemm_tiled2",
+    "lg_attn_prefill_scores2",
+    "lg_attn_prefill_out2",
     "lg_q8_0_gemv",
     // gather / scatter / decode helpers
     "lg_extract_rows",
