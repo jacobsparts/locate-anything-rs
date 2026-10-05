@@ -67,7 +67,15 @@ pub struct Scratch {
     pub mask: Buffer,     // [seq_kv, seq_q]
     pub qs: Buffer,       // int8 [seq][inter]  (dp4a activation quantization)
     pub sc: Buffer,       // f32  [seq][inter/32] (per-32-block scales, column-major over blocks)
+    /// Split-K flash-decode attention workspace (ntq == 1 only): P partial
+    /// online-softmax states per head. Tiny (n_heads * SK_P * hd f32 = 256 KB).
+    pub sk_m: Buffer, // f32 [n_heads, SK_P]
+    pub sk_l: Buffer, // f32 [n_heads, SK_P]
+    pub sk_a: Buffer, // f32 [n_heads, SK_P, hd]
 }
+
+/// Key-range chunks for the split-K decode attention (one warp each).
+pub const SK_P: usize = 32;
 
 impl Scratch {
     pub fn new(lm: &Lm, seq: usize) -> Result<Scratch, String> {
@@ -100,6 +108,9 @@ impl Scratch {
             mask: Buffer::alloc(seq * seq * 4)?,
             qs: Buffer::alloc(lm.inter * seq)?,
             sc: Buffer::alloc((lm.inter / 32) * seq * 4)?,
+            sk_m: Buffer::alloc(lm.n_heads * SK_P * 4)?,
+            sk_l: Buffer::alloc(lm.n_heads * SK_P * 4)?,
+            sk_a: Buffer::alloc(lm.n_heads * SK_P * lm.head_dim * 4)?,
         })
     }
 }
@@ -420,6 +431,50 @@ impl K {
         aa.launch(self.module_of("lg_attn_gqa")?, "lg_attn_gqa", Launch::new((((jobs) + warps - 1) / warps, 1, 1), (warps * 32, 1, 1)).shared(0))
     }
 
+    /// Split-K flash-decode attention (ntq == 1). Same result as `attn_gqa`
+    /// up to f32 reassociation, but parallelizes the key walk across SK_P
+    /// chunks instead of one warp walking every key serially. Requires the
+    /// `sk_m`/`sk_l`/`sk_a` workspace from `Scratch`.
+    pub fn attn_gqa_sk(
+        &self,
+        q: CUdeviceptr,
+        k: CUdeviceptr,
+        v: CUdeviceptr,
+        mask: CUdeviceptr,
+        out: CUdeviceptr,
+        pm: CUdeviceptr,
+        pl: CUdeviceptr,
+        pa: CUdeviceptr,
+        hd: usize,
+        n_qh: usize,
+        n_kvh: usize,
+        ntq: usize,
+        ntk: usize,
+    ) -> Result<(), String> {
+        if cuda::cpu_mode() {
+            return cpu::attn(q, k, v, mask, out, hd, n_qh, n_kvh, ntq, ntk);
+        }
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let p = SK_P as u32;
+        let mut aa = Args::new();
+        aa.ptr(q).ptr(k).ptr(v).ptr(mask).ptr(pm).ptr(pl).ptr(pa)
+            .i32(hd as i32).i32(n_qh as i32).i32(n_kvh as i32).i32(ntq as i32).i32(ntk as i32)
+            .i32(SK_P as i32).f32(scale);
+        aa.launch(
+            self.module_of("lg_attn_gqa_sk_p1")?,
+            "lg_attn_gqa_sk_p1",
+            Launch::new((p, n_qh as u32, 1), (32, 1, 1)).shared(0),
+        )?;
+        let mut ab = Args::new();
+        ab.ptr(pm).ptr(pl).ptr(pa).ptr(out)
+            .i32(hd as i32).i32(n_qh as i32).i32(SK_P as i32);
+        ab.launch(
+            self.module_of("lg_attn_gqa_sk_p2")?,
+            "lg_attn_gqa_sk_p2",
+            Launch::new((n_qh as u32, 1, 1), (32, 1, 1)).shared(0),
+        )
+    }
+
     /// Batched-GEMM prefill attention: scores -> row softmax -> PV, over the
     /// whole prompt at once. The CPU backend keeps `lg_attn_gqa`'s twin, so the
     /// two paths stay comparable.
@@ -515,20 +570,23 @@ impl K {
         ntq: usize,
         ntk: usize,
     ) -> Result<(), String> {
-        let qt = 16usize;
         let mut aa = Args::new();
         aa.ptr(p).ptr(v).ptr(out)
             .i32(hd as i32).i32(n_qh as i32).i32(n_kvh as i32)
             .i32(ntq as i32).i32(ntk as i32);
-        // One block per (query tile, head); the 128 threads are the head
-        // dimension, so hd must not exceed the block. Both of this engine's
-        // head sizes are within it: 128 (LM) and 72 (ViT, via the query-tiled
-        // path). A larger head would silently drop threads past 128.
-        assert!(hd <= 128, "lg_attn_prefill_out requires hd <= 128 (got {hd})");
+        // Transposed-w GEMM: a 256-thread block computes a 64x32 output tile
+        // (channel x query) over an 8-deep key tile, so the grid is
+        // (ceil(hd/64), ceil(ntq/32), n_qh) and the block is 256. hd is no
+        // longer tied to the block size; both of this engine's head sizes
+        // (128 LM, 72 ViT) are handled uniformly.
         aa.launch(
             self.module_of("lg_attn_prefill_out")?,
             "lg_attn_prefill_out",
-            Launch::new((1, ((ntq + qt - 1) / qt) as u32, n_qh as u32), (128, 1, 1)).shared(0),
+            Launch::new(
+                (((hd + 63) / 64) as u32, ((ntq + 31) / 32) as u32, n_qh as u32),
+                (256, 1, 1),
+            )
+            .shared(0),
         )
     }
 
@@ -946,12 +1004,23 @@ impl Lm {
             k.copy_row(s.k.ptr, kv.k[i].ptr + off, row)?;
             k.copy_row(s.v.ptr, kv.v[i].ptr + off, row)?;
 
-            k.attn_gqa(
+            // Decode step: split-K flash-decode. The old warp-per-token
+            // lg_attn_gqa ran 16 warps walking ntk keys serially (85 ms/token
+            // at ntk=1391 across 36 layers = the whole decode gap); the split-K
+            // form walks the key range across SK_P chunks in parallel. 106.7 ->
+            // 25.3 ms/token in-situ (decode was attention-bound, now GEMV-bound
+            // at the ~21ms q8 bandwidth floor). Output matches serial attn up to
+            // f32 softmax reassociation (box1 near-tie flips ~1.5px, the same
+            // values the reference itself is nondeterministic between).
+            k.attn_gqa_sk(
                 s.q.ptr,
                 kv.k[i].ptr,
                 kv.v[i].ptr,
                 kv.mask.ptr,
                 s.attn_out.ptr,
+                s.sk_m.ptr,
+                s.sk_l.ptr,
+                s.sk_a.ptr,
                 self.head_dim,
                 self.n_heads,
                 self.n_kv_heads,

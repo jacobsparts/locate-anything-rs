@@ -29,6 +29,8 @@ const TOOLKIT_KERNELS: &[&str] = &[
     // form (scores -> row softmax -> PV), which the ViT also uses via
     // query tiles
     "lg_attn_gqa",
+    "lg_attn_gqa_sk_p1",
+    "lg_attn_gqa_sk_p2",
     "lg_attn_prefill_scores",
     "lg_attn_prefill_softmax",
     "lg_attn_prefill_out",
