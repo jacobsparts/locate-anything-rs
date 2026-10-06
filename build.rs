@@ -37,6 +37,7 @@ const TOOLKIT_KERNELS: &[&str] = &[
     // GEMM / quantized GEMM
     "lg_f32_gemm",
     "lg_f32_gemm_tiled",
+    "lg_f32_gemm_v2",
     "lg_quantize_q8_0",
     "lg_q8_0_gemm_dp4a",
     "lg_q8_0_gemm_aligned",

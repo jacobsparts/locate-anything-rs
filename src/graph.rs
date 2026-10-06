@@ -388,7 +388,7 @@ impl K {
         }
         let mut aa = Args::new();
         aa.ptr(w).ptr(x).ptr(y).i32(ne0 as i32).i32(ne1 as i32).i32(ncols as i32);
-        aa.launch(self.module_of("lg_f32_gemm_tiled")?, "lg_f32_gemm_tiled", Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 31) / 32) as u32, 1), (256, 1, 1)).shared(0))
+        aa.launch(self.module_of("lg_f32_gemm_v2")?, "lg_f32_gemm_v2", Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 63) / 64) as u32, 1), (256, 1, 1)).shared(0))
     }
 
     /// y[ne1, ncols] = W_f32[ne1,ne0] * x[ne0,ncols]
@@ -401,6 +401,21 @@ impl K {
         ne1: usize,
         ncols: usize,
     ) -> Result<(), String> {
+        if GemmProf::enabled() {
+            self.sync()?;
+            let t = std::time::Instant::now();
+            let r = if ne0 % 4 != 0 {
+                self.gemm_f32_scalar(w, x, y, ne0, ne1, ncols)
+            } else {
+                self.gemm_f32_tiled2(w, x, y, ne0, ne1, ncols)
+            };
+            self.sync()?;
+            GemmProf::rec_op(
+                &format!("f32 {ne0}x{ne1} cols={ncols}"),
+                t.elapsed().as_secs_f64() * 1e3,
+            );
+            return r;
+        }
         // The tiled kernel uses float4 loads, which need ne0 % 4 == 0 and
         // 16-byte-aligned row starts; fall back to the scalar kernel otherwise
         // (e.g. the 588-wide patch-embed weight).
