@@ -33,6 +33,9 @@ const TOOLKIT_KERNELS: &[&str] = &[
     "lg_attn_gqa_sk_p2",
     "lg_attn_prefill_scores",
     "lg_attn_prefill_softmax",
+    "lg_attn_prefill_softmax_cached",
+    "lg_attn_prefill_stats",
+    "lg_attn_prefill_out_softmax",
     "lg_attn_prefill_out",
     // GEMM / quantized GEMM
     "lg_f32_gemm",

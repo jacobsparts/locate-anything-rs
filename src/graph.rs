@@ -653,8 +653,8 @@ impl K {
         let mut aa = Args::new();
         aa.ptr(s).i32(ntq as i32).i32(ntk as i32);
         aa.launch(
-            self.module_of("lg_attn_prefill_softmax")?,
-            "lg_attn_prefill_softmax",
+            self.module_of("lg_attn_prefill_softmax_cached")?,
+            "lg_attn_prefill_softmax_cached",
             Launch::new((1, ntq as u32, n_qh as u32), (256, 1, 1)).shared(0),
         )
     }
@@ -691,9 +691,10 @@ impl K {
         )
     }
 
-    /// Query-tiled batched attention: the three prefill stages run once per
-    /// query tile, so the score matrix is `n_qh * qt * ntk` instead of
-    /// `n_qh * ntq * ntk`.
+    /// Query-tiled batched attention. Scratch holds `n_qh * min(qt, ntq) *
+    /// (ntk + 2)` floats: scores followed by row max/inverse-sum statistics.
+    /// For ntk <= 8192, softmax normalization is fused into PV staging.
+    /// LA_FUSED=0 selects the separate cached-softmax/PV path for A/B tests.
     ///
     /// Tiling bounds the score matrix at `n_qh * qt * ntk` floats instead of
     /// `n_qh * ntq * ntk` (44 MB at qt=128 rather than 1.87 GB at qt=5408).
@@ -723,6 +724,7 @@ impl K {
         assert!(qt > 0, "query tile must be non-zero");
         let prof = GemmProf::enabled();
         let row = (n_qh * hd * 4) as u64; // bytes per query token across all heads
+        let fused = ntk <= 8192 && std::env::var("LA_FUSED").map(|v| v != "0").unwrap_or(true);
         let mut q0 = 0usize;
         while q0 < ntq {
             let n = qt.min(ntq - q0);
@@ -732,6 +734,30 @@ impl K {
             if prof {
                 self.sync()?;
                 GemmProf::rec_op("attn_scores", t0.elapsed().as_secs_f64() * 1e3);
+            }
+            if fused {
+                let stats = s + (n_qh * n * ntk * 4) as u64;
+                let t1 = std::time::Instant::now();
+                let mut aa = Args::new();
+                aa.ptr(s).ptr(stats).i32(n as i32).i32(ntk as i32);
+                aa.launch(self.module_of("lg_attn_prefill_stats")?, "lg_attn_prefill_stats",
+                    Launch::new((1, n as u32, n_qh as u32), (256, 1, 1)).shared(0))?;
+                if prof {
+                    self.sync()?;
+                    GemmProf::rec_op("attn_stats", t1.elapsed().as_secs_f64() * 1e3);
+                }
+                let t2 = std::time::Instant::now();
+                let mut ab = Args::new();
+                ab.ptr(s).ptr(stats).ptr(v).ptr(out + off).i32(hd as i32)
+                    .i32(n_qh as i32).i32(n_kvh as i32).i32(n as i32).i32(ntk as i32);
+                ab.launch(self.module_of("lg_attn_prefill_out_softmax")?, "lg_attn_prefill_out_softmax",
+                    Launch::new((((hd + 63) / 64) as u32, ((n + 63) / 64) as u32, n_qh as u32), (256, 1, 1)).shared(0))?;
+                if prof {
+                    self.sync()?;
+                    GemmProf::rec_op("attn_fused_out", t2.elapsed().as_secs_f64() * 1e3);
+                }
+                q0 += n;
+                continue;
             }
             let t1 = std::time::Instant::now();
             self.attn_prefill_softmax(s, n, ntk, n_qh)?;
@@ -1430,9 +1456,8 @@ pub struct VitScratch {
     pub k: Buffer,
     pub v: Buffer,
     pub attn: Buffer,   // [hidden, ntok]
-    /// [n_heads, qtile, ntok] score matrix for the query-tiled batched
-    /// attention. Sized by the tile, not by ntok, so the allocation stays at
-    /// tens of MB even though ntok is 5408.
+    /// Query-tiled scores plus two softmax statistics per head/query row.
+    /// Sized by the tile, not by ntok, so the allocation stays at tens of MB.
     pub sc_pre: Buffer,
     pub ff: Buffer,     // [inter, ntok]
     pub vf: Buffer,     // [hidden, ntok] post final_norm
@@ -1460,7 +1485,7 @@ impl VitScratch {
             k: Buffer::alloc(v.hidden * ntok * 4)?,
             v: Buffer::alloc(v.hidden * ntok * 4)?,
             attn: Buffer::alloc(v.hidden * ntok * 4)?,
-            sc_pre: Buffer::alloc(v.n_heads * qtile.min(ntok) * ntok * 4)?,
+            sc_pre: Buffer::alloc(v.n_heads * qtile.min(ntok) * (ntok + 2) * 4)?,
             ff: Buffer::alloc(v.inter * ntok * 4)?,
             vf: Buffer::alloc(v.hidden * ntok * 4)?,
             merged: Buffer::alloc(4 * v.hidden * m * 4)?,
