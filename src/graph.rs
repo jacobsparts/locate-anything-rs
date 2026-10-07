@@ -354,6 +354,16 @@ impl K {
             Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 31) / 32) as u32, 1), (256, 1, 1)).shared(0))
     }
 
+    /// Shape-specific q8 square projection kernel. Weight staging is faster
+    /// for ne0=ne1=2048 on the LM workload; LA_Q8_SQUARE=0 selects baseline.
+    pub fn gemm_q8_square_v2(&self, w: CUdeviceptr, qs: CUdeviceptr, sc: CUdeviceptr,
+        y: CUdeviceptr, ne0: usize, ne1: usize, ncols: usize) -> Result<(), String> {
+        let mut aa = Args::new();
+        aa.ptr(w).ptr(qs).ptr(sc).ptr(y).i32(ne0 as i32).i32(ne1 as i32).i32(ncols as i32);
+        aa.launch(self.module_of("lg_q8_0_gemm_square_v2")?, "lg_q8_0_gemm_square_v2",
+            Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 31) / 32) as u32, 1), (256, 1, 1)).shared(0))
+    }
+
     /// q8_0 GEMM with the fastest available kernel: quantize the activation into
     /// `qs`/`sc` and run the dp4a GEMM over the aligned 36-byte weight layout.
     pub fn gemm_q8_fast(
@@ -377,13 +387,13 @@ impl K {
             self.sync()?;
             GemmProf::rec_op(&format!("q8_quant {ne0} cols={ncols}"), t.elapsed().as_secs_f64() * 1e3);
             let t = std::time::Instant::now();
-            if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 { self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols)?; } else { self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols)?; }
+            if ne0 == 2048 && ne1 == 2048 && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) { self.gemm_q8_square_v2(w, qs, sc, y, ne0, ne1, ncols)?; } else if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 { self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols)?; } else { self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols)?; }
             self.sync()?;
             GemmProf::rec_op(&format!("q8_dp4a {ne0}x{ne1} cols={ncols}"), t.elapsed().as_secs_f64() * 1e3);
             return Ok(());
         }
         self.quantize_q8_0(x, qs, sc, ne0, ncols)?;
-        if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 { self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols) } else { self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols) }
+        if ne0 == 2048 && ne1 == 2048 && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) { self.gemm_q8_square_v2(w, qs, sc, y, ne0, ne1, ncols) } else if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 { self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols) } else { self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols) }
     }
 
     /// v8-style f32 GEMM (64 rows x 32 columns per block). Requires ne0 % 4 == 0.
