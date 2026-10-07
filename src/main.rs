@@ -336,7 +336,6 @@ fn cmd_detect(path: &PathBuf, image: &str, query: &str) -> Result<(), String> {
     // CUDA must be initialised before any allocation.
     let k = graph::K::new()?;
     let w = model::DeviceWeights::load(&c)?;
-
     // ---- vision path ----
     let t_vit = std::time::Instant::now();
     let merged = v.forward(&k, &w, &pre.pixel_values)?;

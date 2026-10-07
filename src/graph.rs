@@ -14,6 +14,8 @@ use lightgpu::vm::{Args, Launch};
 use crate::cuda::cuda_ffi::{self, CUdeviceptr};
 use crate::model::DeviceWeights;
 
+
+
 pub struct Lm {
     pub n_layers: usize,
     pub hidden: usize,
@@ -27,59 +29,6 @@ pub struct Lm {
 }
 
 
-/// Env-gated in-situ GEMM profiler (LA_PROF=1): accumulate per-shape wall time
-/// across `gemm_q8_fast` calls, then dump. Resolves the bench-vs-in-situ
-/// contradiction by measuring the real shapes the engine actually runs.
-pub struct GemmProf;
-/// (ne0, ne1, ncols, count, total_ms, label). label empty = a q8 GEMM keyed by
-/// shape; label set = a named non-GEMM op (ViT attention sub-kernels, f32 GEMM).
-static GPROF: std::sync::Mutex<Vec<(usize, usize, usize, usize, f64, String)>> =
-    std::sync::Mutex::new(Vec::new());
-impl GemmProf {
-    pub fn enabled() -> bool {
-        std::env::var("LA_PROF").map(|v| v == "1").unwrap_or(false)
-    }
-    pub fn rec(ne0: usize, ne1: usize, ncols: usize, ms: f64) {
-        let mut g = GPROF.lock().unwrap();
-        for e in g.iter_mut() {
-            if e.5.is_empty() && e.0 == ne0 && e.1 == ne1 && e.2 == ncols {
-                e.3 += 1;
-                e.4 += ms;
-                return;
-            }
-        }
-        g.push((ne0, ne1, ncols, 1, ms, String::new()));
-    }
-    pub fn rec_op(label: &str, ms: f64) {
-        let mut g = GPROF.lock().unwrap();
-        for e in g.iter_mut() {
-            if e.5 == label {
-                e.3 += 1;
-                e.4 += ms;
-                return;
-            }
-        }
-        g.push((0, 0, 0, 1, ms, label.to_string()));
-    }
-    pub fn dump(tag: &str) {
-        let g = GPROF.lock().unwrap();
-        eprintln!("--- GEMM profile [{tag}] ---");
-        let mut tot = 0.0;
-        for (ne0, ne1, ncols, n, ms, label) in g.iter() {
-            if label.is_empty() {
-                let fl = 2.0 * (*ne0 as f64) * (*ne1 as f64) * (*ncols as f64) * (*n as f64);
-                eprintln!(
-                    "  q8 {ne0:5}x{ne1:6} cols={ncols:5} x{n:3}  {ms:9.2} ms  {:7.0} GF/s",
-                    fl / (*ms) / 1e3
-                );
-            } else {
-                eprintln!("  {label:28} x{n:3}  {ms:9.2} ms");
-            }
-            tot += *ms;
-        }
-        eprintln!("  TOTAL {tot:.2} ms");
-    }
-}
 /// Reusable per-step buffers for incremental decoding, so decode_step does not
 /// re-allocate (and re-zero) a batch-sized scratch, a position buffer and a
 /// vocab-sized logits staging buffer on every token.
@@ -175,6 +124,7 @@ impl Scratch {
 pub struct K {
     /// None on the CPU backend (no fatbin is loaded at all).
     pub module: Option<Module>,
+    pub mmq_module: Option<Module>,
 }
 
 impl K {
@@ -187,7 +137,7 @@ impl K {
         {
             cuda::set_cpu_mode(true);
             eprintln!("backend   : CPU (built without the `cuda` feature)");
-            return Ok(K { module: None });
+            return Ok(K { module: None, mmq_module: None });
         }
         #[cfg(feature = "cuda")]
         {
@@ -200,12 +150,13 @@ impl K {
             }
             if cuda::cpu_mode() {
                 eprintln!("backend   : CPU");
-                return Ok(K { module: None });
+                return Ok(K { module: None, mmq_module: None });
             }
             let module = Module::load(cuda::embed_toolkit_fatbin())?;
             eprintln!("backend   : CUDA");
             Ok(K {
                 module: Some(module),
+                mmq_module: Some(Module::load(include_bytes!(env!("LIGHTGPU_FATBIN_LA_MMQ")))?),
             })
         }
     }
@@ -327,25 +278,7 @@ impl K {
 
     /// Tiled q8_0 GEMM (4x arithmetic intensity): locate-anything exclusive.
     /// Same signature as gemm_q8_dp4a6 but grid (ceil(ne1/128), ceil(ncols/64)).
-    pub fn gemm_q8_tiled2(
-        &self,
-        w: CUdeviceptr,
-        qs: CUdeviceptr,
-        sc: CUdeviceptr,
-        y: CUdeviceptr,
-        ne0: usize,
-        ne1: usize,
-        ncols: usize,
-    ) -> Result<(), String> {
-        if cuda::cpu_mode() {
-            return cpu::q8_gemm(w, qs, sc, y, ne0, ne1, ncols, None);
-        }
-        let mut aa = Args::new();
-        aa.ptr(w).ptr(qs).ptr(sc).ptr(y).i32(ne0 as i32).i32(ne1 as i32).i32(ncols as i32);
-        aa.launch(self.module_of("lg_q8_0_gemm_tiled2")?, "lg_q8_0_gemm_tiled2", Launch::new((((ne1 + 127) / 128) as u32, ((ncols + 63) / 64) as u32, 1), (256, 1, 1)).shared(0))
-    }
-    /// Shape-specific q8 down-projection kernel. Weight staging is faster for
-    /// ne0=2048, ne1=11008 on SM61; LA_Q8_V2=0 selects the baseline.
+    /// Shape-specific q8 down-projection kernel.
     pub fn gemm_q8_down_v2(&self, w: CUdeviceptr, qs: CUdeviceptr, sc: CUdeviceptr,
         y: CUdeviceptr, ne0: usize, ne1: usize, ncols: usize) -> Result<(), String> {
         let mut aa = Args::new();
@@ -354,8 +287,7 @@ impl K {
             Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 31) / 32) as u32, 1), (256, 1, 1)).shared(0))
     }
 
-    /// Shape-specific q8 square projection kernel. Weight staging is faster
-    /// for ne0=ne1=2048 on the LM workload; LA_Q8_SQUARE=0 selects baseline.
+    /// Shape-specific q8 square projection kernel.
     pub fn gemm_q8_square_v2(&self, w: CUdeviceptr, qs: CUdeviceptr, sc: CUdeviceptr,
         y: CUdeviceptr, ne0: usize, ne1: usize, ncols: usize) -> Result<(), String> {
         let mut aa = Args::new();
@@ -365,13 +297,30 @@ impl K {
     }
 
     /// Shape-specific read-only-cache q8 kernel for ne0=11008, ne1=2048.
-    /// LA_Q8_UP=0 selects the baseline for A/B.
     pub fn gemm_q8_up_v2(&self, w: CUdeviceptr, qs: CUdeviceptr, sc: CUdeviceptr,
         y: CUdeviceptr, ne0: usize, ne1: usize, ncols: usize) -> Result<(), String> {
         let mut aa = Args::new();
         aa.ptr(w).ptr(qs).ptr(sc).ptr(y).i32(ne0 as i32).i32(ne1 as i32).i32(ncols as i32);
         aa.launch(self.module_of("lg_q8_0_gemm_up_v2")?, "lg_q8_0_gemm_up_v2",
             Launch::new((((ne1 + 63) / 64) as u32, ((ncols + 31) / 32) as u32, 1), (256, 1, 1)).shared(0))
+    }
+
+    /// Reference MMQ mapping; retains the existing activation quantizer.
+    fn gemm_q8_mmq_ref(&self, w: CUdeviceptr, qs: CUdeviceptr, sc: CUdeviceptr,
+        y: CUdeviceptr, ne0: usize, ne1: usize, ncols: usize) -> Result<(), String> {
+        if ne0 == 0 || ne0 % 256 != 0 || ne1 == 0 || ncols == 0 {
+            return Err("MMQ requires positive dimensions and K divisible by 256".into());
+        }
+        let np = (ncols + 63) / 64 * 64;
+        let packed = Buffer::alloc(np * ((ne0 + 127) / 128) * 144)?;
+        let m = self.mmq_module.as_ref().ok_or("MMQ module unavailable")?;
+        let mut a = Args::new();
+        a.ptr(qs).ptr(sc).ptr(packed.ptr).i32(ne0 as i32).i32(ncols as i32).i32(np as i32);
+        a.launch(m, "la_q8_mmq_pack", Launch::new((np as u32, ((ne0+127)/128) as u32, 1), (32,1,1)))?;
+        let mut b = Args::new();
+        b.ptr(w).ptr(packed.ptr).ptr(y).i32(ne0 as i32).i32(ne1 as i32).i32(ncols as i32).i32(np as i32);
+        b.launch(m, "la_q8_mmq_ref", Launch::new((((ne1+63)/64) as u32, ((ncols+63)/64) as u32,1), (32,8,1)))?;
+        self.sync() // packed must outlive both launches
     }
 
     /// q8_0 GEMM with the fastest available kernel: quantize the activation into
@@ -387,35 +336,18 @@ impl K {
         ne1: usize,
         ncols: usize,
     ) -> Result<(), String> {
-        if GemmProf::enabled() {
-            // Drain queued work first so this GEMM's measurement absorbs only
-            // its own kernels, not whatever non-gemm work was launched since the
-            // last timed call (ViT attention sits between wo and the next gemm).
-            self.sync()?;
-            let t = std::time::Instant::now();
-            self.quantize_q8_0(x, qs, sc, ne0, ncols)?;
-            self.sync()?;
-            GemmProf::rec_op(&format!("q8_quant {ne0} cols={ncols}"), t.elapsed().as_secs_f64() * 1e3);
-            let t = std::time::Instant::now();
-            if ne0 == 11008 && ne1 == 2048 && std::env::var("LA_Q8_UP").map(|v| v != "0").unwrap_or(true) {
-                self.gemm_q8_up_v2(w, qs, sc, y, ne0, ne1, ncols)?;
-            } else if ne0 == 2048 && (ne1 == 2048 || ne1 == 256) && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) {
-                self.gemm_q8_square_v2(w, qs, sc, y, ne0, ne1, ncols)?;
-            } else if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 {
-                self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols)?;
-            } else {
-                self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols)?;
-            }
-            self.sync()?;
-            GemmProf::rec_op(&format!("q8_dp4a {ne0}x{ne1} cols={ncols}"), t.elapsed().as_secs_f64() * 1e3);
-            return Ok(());
-        }
         self.quantize_q8_0(x, qs, sc, ne0, ncols)?;
-        if ne0 == 11008 && ne1 == 2048 && std::env::var("LA_Q8_UP").map(|v| v != "0").unwrap_or(true) {
+        if !cuda::cpu_mode()
+            && ncols >= 64
+            && ((ne0 == 2048 && (ne1 == 2048 || ne1 == 256 || ne1 == 11008))
+                || (ne0 == 11008 && ne1 == 2048))
+        {
+            self.gemm_q8_mmq_ref(w, qs, sc, y, ne0, ne1, ncols)
+        } else if !cuda::cpu_mode() && ne0 == 11008 && ne1 == 2048 {
             self.gemm_q8_up_v2(w, qs, sc, y, ne0, ne1, ncols)
-        } else if ne0 == 2048 && (ne1 == 2048 || ne1 == 256) && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) {
+        } else if !cuda::cpu_mode() && ne0 == 2048 && (ne1 == 2048 || ne1 == 256) {
             self.gemm_q8_square_v2(w, qs, sc, y, ne0, ne1, ncols)
-        } else if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 {
+        } else if !cuda::cpu_mode() && ne0 == 2048 && ne1 == 11008 {
             self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols)
         } else {
             self.gemm_q8_dp4a6(w, qs, sc, y, ne0, ne1, ncols)
@@ -450,24 +382,9 @@ impl K {
         ne1: usize,
         ncols: usize,
     ) -> Result<(), String> {
-        if GemmProf::enabled() {
-            self.sync()?;
-            let t = std::time::Instant::now();
-            let r = if ne0 % 4 != 0 {
-                self.gemm_f32_scalar(w, x, y, ne0, ne1, ncols)
-            } else {
-                self.gemm_f32_tiled2(w, x, y, ne0, ne1, ncols)
-            };
-            self.sync()?;
-            GemmProf::rec_op(
-                &format!("f32 {ne0}x{ne1} cols={ncols}"),
-                t.elapsed().as_secs_f64() * 1e3,
-            );
-            return r;
+        if cuda::cpu_mode() {
+            return cpu::f32_gemm(w, x, y, ne0, ne1, ncols);
         }
-        // The tiled kernel uses float4 loads, which need ne0 % 4 == 0 and
-        // 16-byte-aligned row starts; fall back to the scalar kernel otherwise
-        // (e.g. the 588-wide patch-embed weight).
         if ne0 % 4 != 0 {
             return self.gemm_f32_scalar(w, x, y, ne0, ne1, ncols);
         }
@@ -557,29 +474,6 @@ impl K {
         aa.launch(self.module_of("lg_rope_neox")?, "lg_rope_neox", Launch::new(((((hd / 2) as u32) + 63) / 64, nh as u32, ntok as u32), (64, 1, 1)).shared(0))
     }
 
-    pub fn attn_gqa(
-        &self,
-        q: CUdeviceptr,
-        k: CUdeviceptr,
-        v: CUdeviceptr,
-        mask: CUdeviceptr,
-        out: CUdeviceptr,
-        hd: usize,
-        n_qh: usize,
-        n_kvh: usize,
-        ntq: usize,
-        ntk: usize,
-    ) -> Result<(), String> {
-        if cuda::cpu_mode() {
-            return cpu::attn(q, k, v, mask, out, hd, n_qh, n_kvh, ntq, ntk);
-        }
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        let jobs = (n_qh * ntq) as u32;
-        let warps = 8u32;
-        let mut aa = Args::new();
-        aa.ptr(q).ptr(k).ptr(v).ptr(mask).ptr(out).i32(hd as i32).i32(n_qh as i32).i32(n_kvh as i32).i32(ntq as i32).i32(ntk as i32).f32(scale);
-        aa.launch(self.module_of("lg_attn_gqa")?, "lg_attn_gqa", Launch::new((((jobs) + warps - 1) / warps, 1, 1), (warps * 32, 1, 1)).shared(0))
-    }
 
     /// Split-K flash-decode attention (ntq == 1). Same result as `attn_gqa`
     /// up to f32 reassociation, but parallelizes the key walk across SK_P
@@ -669,10 +563,6 @@ impl K {
         ntk: usize,
     ) -> Result<(), String> {
         let scale = 1.0f32 / (hd as f32).sqrt();
-        // Must match LA_PF_QT/LA_PF_KT in the kernel: the launch shape and the
-        // tile shape are two halves of one contract, and a mismatch computes the
-        // wrong scores rather than failing loudly.
-        let qt = 32usize;
         let mut aa = Args::new();
         aa.ptr(q).ptr(kk).ptr(mask).ptr(s)
             .i32(hd as i32).i32(n_qh as i32).i32(n_kvh as i32)
@@ -743,7 +633,6 @@ impl K {
     /// Query-tiled batched attention. Scratch holds `n_qh * min(qt, ntq) *
     /// (ntk + 2)` floats: scores followed by row max/inverse-sum statistics.
     /// For ntk <= 8192, softmax normalization is fused into PV staging.
-    /// LA_FUSED=0 selects the separate cached-softmax/PV path for A/B tests.
     ///
     /// Tiling bounds the score matrix at `n_qh * qt * ntk` floats instead of
     /// `n_qh * ntq * ntk` (44 MB at qt=128 rather than 1.87 GB at qt=5408).
@@ -754,71 +643,35 @@ impl K {
     /// `q[(q0+r)*n_qh*hd + h*hd + c]`, so passing `ntq = n` with q/out offset by
     /// `q0 * n_qh * hd` makes a tile a complete, self-contained problem.
     pub fn attn_prefill_tiled(
-        &self,
-        q: CUdeviceptr,
-        k: CUdeviceptr,
-        v: CUdeviceptr,
-        s: CUdeviceptr,
-        out: CUdeviceptr,
-        hd: usize,
-        n_qh: usize,
-        n_kvh: usize,
-        ntq: usize,
-        ntk: usize,
-        qt: usize,
+        &self, q: CUdeviceptr, k: CUdeviceptr, v: CUdeviceptr, s: CUdeviceptr,
+        out: CUdeviceptr, hd: usize, n_qh: usize, n_kvh: usize,
+        ntq: usize, ntk: usize, qt: usize,
     ) -> Result<(), String> {
         if cuda::cpu_mode() {
             return cpu::attn(q, k, v, 0, out, hd, n_qh, n_kvh, ntq, ntk);
         }
         assert!(qt > 0, "query tile must be non-zero");
-        let prof = GemmProf::enabled();
-        let row = (n_qh * hd * 4) as u64; // bytes per query token across all heads
-        let fused = ntk <= 8192 && std::env::var("LA_FUSED").map(|v| v != "0").unwrap_or(true);
+        let row = (n_qh * hd * 4) as u64;
+        let fused = ntk <= 8192;
         let mut q0 = 0usize;
         while q0 < ntq {
             let n = qt.min(ntq - q0);
             let off = q0 as u64 * row;
-            let t0 = std::time::Instant::now();
             self.attn_prefill_scores(q + off, k, 0, s, hd, n_qh, n_kvh, n, ntk)?;
-            if prof {
-                self.sync()?;
-                GemmProf::rec_op("attn_scores", t0.elapsed().as_secs_f64() * 1e3);
-            }
             if fused {
                 let stats = s + (n_qh * n * ntk * 4) as u64;
-                let t1 = std::time::Instant::now();
                 let mut aa = Args::new();
                 aa.ptr(s).ptr(stats).i32(n as i32).i32(ntk as i32);
                 aa.launch(self.module_of("lg_attn_prefill_stats")?, "lg_attn_prefill_stats",
                     Launch::new((1, n as u32, n_qh as u32), (256, 1, 1)).shared(0))?;
-                if prof {
-                    self.sync()?;
-                    GemmProf::rec_op("attn_stats", t1.elapsed().as_secs_f64() * 1e3);
-                }
-                let t2 = std::time::Instant::now();
                 let mut ab = Args::new();
                 ab.ptr(s).ptr(stats).ptr(v).ptr(out + off).i32(hd as i32)
                     .i32(n_qh as i32).i32(n_kvh as i32).i32(n as i32).i32(ntk as i32);
                 ab.launch(self.module_of("lg_attn_prefill_out_softmax")?, "lg_attn_prefill_out_softmax",
                     Launch::new((((hd + 63) / 64) as u32, ((n + 63) / 64) as u32, n_qh as u32), (256, 1, 1)).shared(0))?;
-                if prof {
-                    self.sync()?;
-                    GemmProf::rec_op("attn_fused_out", t2.elapsed().as_secs_f64() * 1e3);
-                }
-                q0 += n;
-                continue;
-            }
-            let t1 = std::time::Instant::now();
-            self.attn_prefill_softmax(s, n, ntk, n_qh)?;
-            if prof {
-                self.sync()?;
-                GemmProf::rec_op("attn_softmax", t1.elapsed().as_secs_f64() * 1e3);
-            }
-            let t2 = std::time::Instant::now();
-            self.attn_prefill_out(s, v, out + off, hd, n_qh, n_kvh, n, ntk)?;
-            if prof {
-                self.sync()?;
-                GemmProf::rec_op("attn_out", t2.elapsed().as_secs_f64() * 1e3);
+            } else {
+                self.attn_prefill_softmax(s, n, ntk, n_qh)?;
+                self.attn_prefill_out(s, v, out + off, hd, n_qh, n_kvh, n, ntk)?;
             }
             q0 += n;
         }
@@ -1477,9 +1330,6 @@ impl Lm {
         k.gemm_q8(head.addr, last, tmp.ptr, self.hidden, self.vocab, 1)?;
         k.copy_bytes(logits.ptr, tmp.ptr, self.vocab * 4)?;
         kv.len = seq;
-        if GemmProf::enabled() {
-            GemmProf::dump("prefill");
-        }
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
-//! Compiles the kernels this engine needs into ONE module.
+//! Compiles the shared toolkit and engine-local MMQ extraction into separate modules.
 //!
-//! Every op here comes from the shared `lightgpu` toolkit, including the
+//! Most ops come from the shared `lightgpu` toolkit, including the
 //! batched-GEMM prefill attention (`lg_attn_prefill_*`), which was written
 //! engine-local first and promoted once it measured faster - see that kernel's
 //! comment in the toolkit for the numbers and for why the obvious version of it
@@ -28,7 +28,6 @@ const TOOLKIT_KERNELS: &[&str] = &[
     // attention: decode (warp per query token) and the batched-GEMM prefill
     // form (scores -> row softmax -> PV), which the ViT also uses via
     // query tiles
-    "lg_attn_gqa",
     "lg_attn_gqa_sk_p1",
     "lg_attn_gqa_sk_p2",
     "lg_attn_prefill_scores",
@@ -80,5 +79,7 @@ fn main() {
             out_name: "la_toolkit.fatbin",
             entries: Some(TOOLKIT_KERNELS),
         },
+        lightgpu_build::Source { path: "cuda/la_q8_mmq.cu", out_name: "la_mmq.fatbin",
+            entries: Some(&["la_q8_mmq_pack", "la_q8_mmq_ref"]), },
     ]);
 }

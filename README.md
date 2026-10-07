@@ -119,9 +119,35 @@ of 32 is stored as q8_0, everything else stays f32. That makes the container
 savings come from quantizing 84 tensors the GGUF leaves in f32 and from storing
 the tied LM head once.
 
+## CPU attention acceleration
+
+On AVX2-capable x86-64 CPUs, attention transposes the current keys into a
+padded temporary and computes eight key scores in parallel. Each score retains
+the scalar reduction order (no FMA or approximate softmax). Other CPUs use the
+scalar fallback.
+
+On the i7-13700K inventory-button fixture, inference decreased from 173–177 s
+to 95–101 s, with identical 22 CPU tokens and three boxes. Peak host RSS remained
+approximately 4.62 GiB. Q8 weights remain memory-mapped, without persistent
+F32 expansion. These measurements do not resolve CPU/GPU numerical differences;
+see `tests/REFERENCE_COMPARISON.md` for the matched-reference comparison.
+
+## CUDA MMQ validation
+
+The LM prefill uses a GGML-derived SM61 warp mapping with a 256-value weight
+K tile and two transposed D4 activation tiles. The original quantizer and
+accumulation order are retained. Decode and unvalidated matrix shapes retain
+existing kernels. On the inventory-button fixture, repeated runs reduced LM
+prefill from 3.51 s to 1.39 s and total time from 10.40 s to 8.33 s, with identical
+22 generated tokens and three boxes. These are fixture timings, not a general
+hardware-independent benchmark. Performance was measured on SM61; the fatbin
+also builds for the existing SM75/SM80 targets, but their performance has not
+been measured.
+
 ## Licence and attribution
 
-The software here is MIT-licensed. The model is NVIDIA's
+The software here is MIT-licensed. The CUDA MMQ mapping is adapted from GGML;
+its authors' MIT notice is included in `cuda/GGML-LICENSE`. The model is NVIDIA's
 [`LocateAnything-3B`](https://huggingface.co/nvidia/LocateAnything-3B), an
 open-vocabulary detection VLM built from Qwen2.5-3B, the MoonViT vision encoder
 and a 2-layer MLP connector. The container format and tensor naming follow
