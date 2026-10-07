@@ -399,7 +399,7 @@ impl K {
             let t = std::time::Instant::now();
             if ne0 == 11008 && ne1 == 2048 && std::env::var("LA_Q8_UP").map(|v| v != "0").unwrap_or(true) {
                 self.gemm_q8_up_v2(w, qs, sc, y, ne0, ne1, ncols)?;
-            } else if ne0 == 2048 && ne1 == 2048 && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) {
+            } else if ne0 == 2048 && (ne1 == 2048 || ne1 == 256) && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) {
                 self.gemm_q8_square_v2(w, qs, sc, y, ne0, ne1, ncols)?;
             } else if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 {
                 self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols)?;
@@ -413,7 +413,7 @@ impl K {
         self.quantize_q8_0(x, qs, sc, ne0, ncols)?;
         if ne0 == 11008 && ne1 == 2048 && std::env::var("LA_Q8_UP").map(|v| v != "0").unwrap_or(true) {
             self.gemm_q8_up_v2(w, qs, sc, y, ne0, ne1, ncols)
-        } else if ne0 == 2048 && ne1 == 2048 && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) {
+        } else if ne0 == 2048 && (ne1 == 2048 || ne1 == 256) && std::env::var("LA_Q8_SQUARE").map(|v| v != "0").unwrap_or(true) {
             self.gemm_q8_square_v2(w, qs, sc, y, ne0, ne1, ncols)
         } else if std::env::var("LA_Q8_V2").map(|v| v != "0").unwrap_or(true) && ne0 == 2048 && ne1 == 11008 {
             self.gemm_q8_down_v2(w, qs, sc, y, ne0, ne1, ncols)
